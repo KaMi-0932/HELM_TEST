@@ -37,6 +37,29 @@ depends: []
 
 #define HELM_CHASSIS_MAX_POWER 100
 
+/* 固定 RAM 符号供 Ozone Data Sampling 使用，不参与控制反馈。 */
+extern "C" {
+inline volatile float helm_plot_cmd_x = 0.0f;
+inline volatile float helm_plot_cmd_y = 0.0f;
+inline volatile float helm_plot_cmd_z = 0.0f;
+inline volatile float helm_plot_omega_reference_radps = 0.0f;
+inline volatile float helm_plot_omega_feedback_radps = 0.0f;
+inline volatile float helm_plot_omega_control_z = 0.0f;
+inline volatile float helm_plot_feedback_valid = 0.0f;
+inline volatile float helm_plot_wheel_target_rpm[4] = {};
+inline volatile float helm_plot_wheel_feedback_rpm[4] = {};
+inline volatile float helm_plot_wheel_current_cmd_lsb[4] = {};
+inline volatile float helm_plot_wheel_reverse[4] = {};
+inline volatile float helm_plot_power_limited = 0.0f;
+}
+struct ChassisVelocity {
+  float x = 0.0f;      // m/s, +x right
+  float y = 0.0f;      // m/s, +y forward
+  float omega = 0.0f;  // rad/s, counterclockwise positive
+  bool valid = false;
+};
+static ChassisVelocity* HOOK_;
+
 template <typename ChassisType>
 class Chassis;
 class Helm {
@@ -234,12 +257,19 @@ class Helm {
     dt_ = (now - last_online_time_).ToSecondf();
     last_online_time_ = now;
 
+    bool feedback_valid = true;
     for (int i = 0; i < 4; i++) {
-      motor_wheel_[i]->Update();
-      motor_steer_[i]->Update();
+      const auto WHEEL_STATUS = motor_wheel_[i]->Update();
+      const auto STEER_STATUS = motor_steer_[i]->Update();
       motor_wheel_feedback_[i] = motor_wheel_[i]->GetFeedback();
       motor_steer_feedback_[i] = motor_steer_[i]->GetFeedback();
+      feedback_valid = feedback_valid &&
+                       WHEEL_STATUS == LibXR::ErrorCode::OK &&
+                       STEER_STATUS == LibXR::ErrorCode::OK &&
+                       motor_wheel_feedback_[i].state != 0 &&
+                       motor_steer_feedback_[i].state != 0;
     }
+    UpdateChassisVelocity(feedback_valid);
   }
 
   /**
@@ -413,6 +443,55 @@ class Helm {
         target_omega_ = 0.0f;
         break;
     }
+    /* 车体速度外环：期望值和正解算反馈均使用物理单位。 */
+    const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
+    const float MAX_CHASSIS_OMEGA = PARAM.wheel_to_center > 1.0e-6f
+                                        ? MAX_WHEEL_LINEAR_SPEED * SQRT2 /
+                                              PARAM.wheel_to_center
+                                        : 0.0f;
+    helm_plot_omega_reference_radps = target_omega_ * MAX_CHASSIS_OMEGA;
+    if (chassis_event_ != ChassisMode::RELAX &&
+        measured_chassis_velocity_.valid && std::isfinite(dt_) &&
+        dt_ > 0.0f && MAX_CHASSIS_OMEGA > 0.0f) {
+      constexpr float MIN_AXIS_COMMAND = 0.05f;
+      constexpr float MAX_TRANSLATION_CORRECTION = 0.1f;
+      constexpr float MAX_ROTATION_CORRECTION = 0.01f;
+      /* 无对应运动指令时跳过车体外环，避免反馈噪声触发舵轮转向。
+       * 零速抗外力仍由各驱动轮速度内环负责。 */
+      if (fabsf(target_vx_) >= MIN_AXIS_COMMAND) {
+        const float VX_CORRECTION = pid_velocity_x_.Calculate(
+            target_vx_ * MAX_WHEEL_LINEAR_SPEED, measured_chassis_velocity_.x,
+            dt_) / MAX_WHEEL_LINEAR_SPEED;
+        target_vx_ += std::clamp(VX_CORRECTION, -MAX_TRANSLATION_CORRECTION,
+                                 MAX_TRANSLATION_CORRECTION);
+      } else {
+        pid_velocity_x_.Reset();
+      }
+      if (fabsf(target_vy_) >= MIN_AXIS_COMMAND) {
+        const float VY_CORRECTION = pid_velocity_y_.Calculate(
+            target_vy_ * MAX_WHEEL_LINEAR_SPEED, measured_chassis_velocity_.y,
+            dt_) / MAX_WHEEL_LINEAR_SPEED;
+        target_vy_ += std::clamp(VY_CORRECTION, -MAX_TRANSLATION_CORRECTION,
+                                 MAX_TRANSLATION_CORRECTION);
+      } else {
+        pid_velocity_y_.Reset();
+      }
+      if (fabsf(target_omega_) >= MIN_AXIS_COMMAND) {
+        const float OMEGA_CORRECTION = pid_omega_.Calculate(
+            target_omega_ * MAX_CHASSIS_OMEGA,
+            measured_chassis_velocity_.omega, dt_) / MAX_CHASSIS_OMEGA;
+        target_omega_ += std::clamp(OMEGA_CORRECTION,
+                                    -MAX_ROTATION_CORRECTION,
+                                    MAX_ROTATION_CORRECTION);
+      } else {
+        pid_omega_.Reset();
+      }
+    } else {
+      pid_velocity_x_.Reset();
+      pid_velocity_y_.Reset();
+      pid_omega_.Reset();
+    }
+
     /* 旋转角速度必须在读取模式命令后换算。 */
     const float CHASSIS_OMEGA_RADPS = PARAM.wheel_to_center > 1.0e-6f
                                           ? target_omega_ * SQRT2 /
@@ -550,6 +629,29 @@ class Helm {
         motor_steer_[i]->Control(motor_steer_cmd_[i]);
       }
     }
+
+    helm_plot_cmd_x = cmd_data_.x;
+    helm_plot_cmd_y = cmd_data_.y;
+    helm_plot_cmd_z = cmd_data_.z;
+    helm_plot_omega_feedback_radps = measured_chassis_velocity_.omega;
+    helm_plot_omega_control_z = target_omega_;
+    helm_plot_feedback_valid = measured_chassis_velocity_.valid ? 1.0f : 0.0f;
+    helm_plot_power_limited =
+        power_control_data_.is_power_limited ? 1.0f : 0.0f;
+    for (int i = 0; i < 4; i++) {
+      helm_plot_wheel_target_rpm[i] =
+          motor_reverse_[i] ? -target_speed_[i] : target_speed_[i];
+      helm_plot_wheel_feedback_rpm[i] = motor_wheel_feedback_[i].velocity;
+      helm_plot_wheel_reverse[i] = motor_reverse_[i] ? 1.0f : 0.0f;
+      helm_plot_wheel_current_cmd_lsb[i] =
+          chassis_event_ == ChassisMode::RELAX ||
+                  PARAM.reduction_ratio <= 1.0e-6f
+              ? 0.0f
+              : std::clamp(
+                    motor_wheel_cmd_[i].torque * M3508_NM_TO_LSB_RATIO /
+                        PARAM.reduction_ratio,
+                    -16384.0f, 16384.0f);
+    }
   }
 
  private:
@@ -559,6 +661,7 @@ class Helm {
     float x;
     float y;
   };
+
 
   WheelPosition GetWheelPosition(uint8_t wheel_index) const {
     const float COMPONENT = PARAM.wheel_to_center * 0.70710678118f;
@@ -576,6 +679,67 @@ class Helm {
     }
   }
 
+  float GetMaxWheelLinearSpeed() const {
+    if (PARAM.wheel_radius <= 1.0e-6f ||
+        PARAM.reduction_ratio <= 1.0e-6f || motor_max_speed_ <= 1.0e-6f) {
+      return 0.0f;
+    }
+    return motor_max_speed_ * static_cast<float>(LibXR::TWO_PI) *
+           PARAM.wheel_radius / (60.0f * PARAM.reduction_ratio);
+  }
+
+  void UpdateChassisVelocity(bool feedback_valid) {
+    measured_chassis_velocity_ = {};
+    if (!feedback_valid || PARAM.wheel_to_center <= 1.0e-6f ||
+        PARAM.wheel_radius <= 1.0e-6f ||
+        PARAM.reduction_ratio <= 1.0e-6f) {
+      return;
+    }
+
+    const float RPM_TO_LINEAR_SPEED =
+        static_cast<float>(LibXR::TWO_PI) * PARAM.wheel_radius /
+        (60.0f * PARAM.reduction_ratio);
+    float sum_vx = 0.0f;
+    float sum_vy = 0.0f;
+    float sum_rotation = 0.0f;
+    float sum_radius_squared = 0.0f;
+    for (int i = 0; i < 4; i++) {
+      const WheelPosition WHEEL_POSITION =
+          GetWheelPosition(static_cast<uint8_t>(i));
+      /* 舵向零位沿 +y，正角朝 +x；电机 reverse 已在反馈解码中处理。 */
+      const float STEER_ANGLE = LibXR::CycleValue<float>(
+          motor_steer_feedback_[i].abs_angle - zero_[i]);
+      const float WHEEL_SPEED =
+          motor_wheel_feedback_[i].velocity * RPM_TO_LINEAR_SPEED;
+      if (!std::isfinite(STEER_ANGLE) || !std::isfinite(WHEEL_SPEED)) {
+        return;
+      }
+      const float WHEEL_VX = WHEEL_SPEED * sinf(STEER_ANGLE);
+      const float WHEEL_VY = WHEEL_SPEED * cosf(STEER_ANGLE);
+      sum_vx += WHEEL_VX;
+      sum_vy += WHEEL_VY;
+      sum_rotation += WHEEL_POSITION.x * WHEEL_VY -
+                      WHEEL_POSITION.y * WHEEL_VX;
+      sum_radius_squared += WHEEL_POSITION.x * WHEEL_POSITION.x +
+                            WHEEL_POSITION.y * WHEEL_POSITION.y;
+    }
+    if (sum_radius_squared <= 1.0e-12f) {
+      return;
+    }
+    measured_chassis_velocity_.x = sum_vx / 4.0f;
+    measured_chassis_velocity_.y = sum_vy / 4.0f;
+    measured_chassis_velocity_.omega = sum_rotation / sum_radius_squared;
+    measured_chassis_velocity_.valid =
+        std::isfinite(measured_chassis_velocity_.x) &&
+        std::isfinite(measured_chassis_velocity_.y) &&
+        std::isfinite(measured_chassis_velocity_.omega);
+    if (!measured_chassis_velocity_.valid) {
+      measured_chassis_velocity_ = {};
+    }
+    HOOK_ = &measured_chassis_velocity_;
+  }
+
+  ChassisVelocity measured_chassis_velocity_{};
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
