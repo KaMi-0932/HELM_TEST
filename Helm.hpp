@@ -709,12 +709,16 @@ class Helm
     for (int i = 0; i < 4; i++)
     {
       motor_data_.rotorspeed_rpm_3508[i] = motor_wheel_feedback_[i].velocity;
-      motor_data_.output_current_3508[i] =
-          motor_wheel_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
+      /* RMMotor 的 reverse 会翻转转速反馈，但力矩反馈保留原始电流方向。
+       * 辨识功率模型前把两者统一到电机逻辑正方向。 */
+      motor_data_.output_current_3508[i] = motor_wheel_feedback_[i].torque *
+                                          motor_wheel_[i]->GetFeedbackTorquePolarity() *
+                                          M3508_NM_TO_LSB_RATIO;
 
       motor_data_.rotorspeed_rpm_6020[i] = motor_steer_feedback_[i].velocity;
-      motor_data_.output_current_6020[i] =
-          motor_steer_feedback_[i].torque * GM6020_NM_TO_LSB_RATIO;
+      motor_data_.output_current_6020[i] = motor_steer_feedback_[i].torque *
+                                          motor_steer_[i]->GetFeedbackTorquePolarity() *
+                                          GM6020_NM_TO_LSB_RATIO;
     }
 
     /* 第一次设置: 反馈数据用于 RLS 参数估计 */
