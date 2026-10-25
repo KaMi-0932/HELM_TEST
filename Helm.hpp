@@ -15,6 +15,7 @@ depends: []
 
 #include "CMD.hpp"
 #include "Chassis.hpp"
+#include "HelmLateralForce.hpp"
 #include "Motor.hpp"
 #include "PowerControl.hpp"
 #include "RMMotor.hpp"
@@ -788,7 +789,8 @@ class Helm
 
   /**
    * @brief 舵轮底盘逆动力学解算
-   * @details 车体速度 PID 输出加速度，生成整车目标合力/力矩。
+   * @details 车体速度 PID 输出速度导数，加上旋转车体系的侧向力补偿，
+   *          生成整车目标合力/力矩。
    *          轮速 PID 计算后，再进行带合计输出约束的实际舵角联合分配。
    */
   void DynamicInverseSolution()
@@ -850,8 +852,18 @@ class Helm
 
     constexpr float GRAVITY_ACCELERATION = 9.80665f;
     const float MASS = PARAM.gravity / GRAVITY_ACCELERATION;
-    requested_wrench_[0] = MASS * target_ax_;
-    requested_wrench_[1] = MASS * target_ay_;
+    const auto BODY_ACCELERATION = HelmLateralForce::compensate_body_acceleration(
+        target_ax_, target_ay_, measured_chassis_velocity_.x,
+        measured_chassis_velocity_.y, measured_chassis_velocity_.omega);
+    if (!BODY_ACCELERATION.valid)
+    {
+      pid_velocity_x_.Reset();
+      pid_velocity_y_.Reset();
+      pid_omega_.Reset();
+      return;
+    }
+    requested_wrench_[0] = MASS * BODY_ACCELERATION.x;
+    requested_wrench_[1] = MASS * BODY_ACCELERATION.y;
     requested_wrench_[2] = PARAM.moment_of_inertia * target_alpha_;
     allocation_target_valid_ = std::isfinite(requested_wrench_[0]) &&
                                std::isfinite(requested_wrench_[1]) &&
