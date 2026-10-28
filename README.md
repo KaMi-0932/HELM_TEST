@@ -10,7 +10,7 @@
 
 模式切换：`GetEvent()` 返回的 `LibXR::Event` 注册了 `ChassisType::ChassisMode` 的各个值，激活对应的事件 ID 即切换模式并复位速度相关的 PID，通常由 `EventBinder` 把遥控器事件绑定到这些 ID。`Mecanum` 与 `Omni` 在 CMD 的 `CMD_EVENT_LOST_CTRL` 与 `CMD_EVENT_START_CTRL` 时切换到 `RELAX`。`RELAX` 模式下所有电机执行 `Relax()`。
 
-控制链（`Mecanum`、`Omni`）：由 `chassis_cmd` 的 x、y、z 得到目标速度，经逆运动学得到各轮目标角速度；轮速 PID 的输出加上速度环与角速度环 PID 得到的前馈力，经 PowerControl 限幅后，以 `MODE_TORQUE` 下发给轮电机，力矩限幅 ±6 N·m。`Helm` 由目标速度解算各轮舵角与轮速，采用低速舵角保持和 cos³ 轮速补偿。正运动学反馈进入车体速度 PID；合力计算加入旋转车体系的侧向力补偿：`Fx = m·(ax - ω·vy)`、`Fy = m·(ay + ω·vx)`，其中速度与角速度取当前四轮正运动学估计值。随后按质量、转动惯量分配轮端力矩，叠加轮速反馈修正后以 `MODE_TORQUE` 下发。舵向采用角度环加速度环，驱动轮力矩限幅 ±4.4 N·m，舵力矩限幅 ±2.5 N·m。Helm 功率预算仅限制驱动轮，舵向输出保持不变。
+控制链（`Mecanum`、`Omni`）：由 `chassis_cmd` 的 x、y、z 得到目标速度，经逆运动学得到各轮目标角速度；轮速 PID 的输出加上速度环与角速度环 PID 得到的前馈力，经 PowerControl 限幅后，以 `MODE_TORQUE` 下发给轮电机，力矩限幅 ±6 N·m。`Helm` 由目标速度解算各轮舵角与轮速，采用低速舵角保持和 cos³ 轮速补偿。正运动学反馈进入车体速度 PID，输出加速度并按质量、转动惯量得到合力和偏航力矩请求。DAQP 将实际舵角、轮速 PID 修正、驱动轮功率和输出约束一起纳入加权分配，再经原功率限幅以 `MODE_TORQUE` 下发。舵向采用角度环加速度环，驱动轮力矩限幅 ±4.4 N·m，舵力矩限幅 ±2.5 N·m。Helm 功率预算仅限制驱动轮，舵向输出保持不变。
 
 功率上限：裁判系统 `chassis_ref` 在 1 s 内有数据且 `chassis_power_limit` 大于 1 W 时使用该值，否则使用默认值（`Mecanum` 70 W，`Omni` 与 `Helm` 100 W）。`chassis_cmd` 的 `self_define` 为 `CMD::ChasStat::BOOST` 且超级电容在线时，按电容能量大于 0.25、0.5、0.8 分别额外增加功率上限：`Mecanum` 与 `Omni` 为 100、200、300 W，`Helm` 为 40、70、100 W。限幅由 `PowerControl` 完成。
 
@@ -22,13 +22,22 @@ Upon construction, the selected chassis creates its control thread (`MecanumChas
 
 Mode switching: the `LibXR::Event` returned by `GetEvent()` has every value of `ChassisType::ChassisMode` registered. Activating the corresponding event ID switches the mode and resets the velocity-related PIDs; an `EventBinder` usually binds remote-controller events to these IDs. `Mecanum` and `Omni` switch to `RELAX` on the CMD events `CMD_EVENT_LOST_CTRL` and `CMD_EVENT_START_CTRL`. In `RELAX` mode all motors execute `Relax()`.
 
-Control chain (`Mecanum`, `Omni`): the x, y and z of `chassis_cmd` give the target velocity, and inverse kinematics gives the target angular velocity of each wheel. The wheel-speed PID output plus the feedforward force from the velocity and angular-velocity PIDs is limited by PowerControl and sent to the wheel motors in `MODE_TORQUE`, with a torque limit of ±6 N·m. `Helm` uses forward and inverse kinematics, low-speed steering hold and cos³ wheel-speed compensation. Its chassis velocity PIDs produce body-frame velocity derivatives. The force calculation adds the rotating-frame lateral-force terms `Fx = m·(ax - ω·vy)` and `Fy = m·(ay + ω·vx)`, using the current four-wheel forward-kinematics estimate. Mass and inertia then map the requested motion to wheel torque feedforward, combined with wheel-speed feedback correction. Steering uses an angle loop plus a speed loop. Outputs use `MODE_TORQUE`, limited to ±4.4 N·m for drive wheels and ±2.5 N·m for steering motors. The Helm power budget limits only the drive wheels; steering output is passed through.
+Control chain (`Mecanum`, `Omni`): the x, y and z of `chassis_cmd` give the target velocity, and inverse kinematics gives the target angular velocity of each wheel. The wheel-speed PID output plus the feedforward force from the velocity and angular-velocity PIDs is limited by PowerControl and sent to the wheel motors in `MODE_TORQUE`, with a torque limit of ±6 N·m. `Helm` uses forward and inverse kinematics, low-speed steering hold and cos³ wheel-speed compensation. Chassis velocity PIDs produce accelerations; mass and inertia give a requested wrench. DAQP allocates final wheel torques using actual steering angles, wheel PID preferences, drive power and actuator bounds, followed by the existing power guard. Steering uses an angle loop plus a speed loop. Outputs use `MODE_TORQUE`, limited to ±4.4 N·m for drive wheels and ±2.5 N·m for steering motors. The Helm power budget limits only the drive wheels; steering output is passed through.
 
 Power limit: when the referee `chassis_ref` has delivered data within 1 s and `chassis_power_limit` is greater than 1 W, that value is used; otherwise the default applies (`Mecanum` 70 W, `Omni` and `Helm` 100 W). When `self_define` of `chassis_cmd` is `CMD::ChasStat::BOOST` and the supercapacitor is online, the limit is raised for capacitor energy above 0.25, 0.5 and 0.8: by 100, 200 and 300 W for `Mecanum` and `Omni`, and by 40, 70 and 100 W for `Helm`. `PowerControl` performs the limiting.
 
 Spin (`ROTOR`) speed scaling (`Mecanum`, `Omni`): the larger the translation input, the more the speed is reduced according to `rotor_speed_scale`. The speed is also scaled dynamically by the referee buffer energy (mapped linearly between `rotor_buffer_low_j` and `rotor_buffer_high_j`) and by how strongly the power is limited, with a lower bound of `rotor_omega_min_scale`, and passes a first-order low-pass filter with coefficient `rotor_scale_lpf_alpha`.
 
+Helm 的功率约束分配、权重、回退与普通成员观测值详见 [HelmPowerAllocation.md](HelmPowerAllocation.md)。 / See [HelmPowerAllocation.md](HelmPowerAllocation.md) for the Helm allocator, priorities, fallback and diagnostics.
+
 ## 2. 底盘类型 / Chassis Types
+
+Helm 的普通成员功率观测值（单位 W，无需超级电容在线）：
+
+- `helm_chassis.chassis_.wheel_output_power_estimated_w_`：最终 Helm 驱动轮力矩命令换算的电流与反馈转速计算的模型正功率总和，在功率限幅和最终力矩/电流限幅之后统计。
+- `helm_chassis.chassis_.wheel_feedback_power_w_`：四个驱动轮反馈力矩换算的电流与反馈转速计算的模型正功率总和；电机 `reverse` 的反馈力矩方向已与转速统一。
+
+两者均逐轮取 `max(0, P)` 再求和，不用制动回馈抵扣其他轮消耗，不计舵向电机或底盘静态损耗，也不是电源端实测功率。输出估计依据 Helm 命令，电机驱动器保护、CAN 延迟和实际电流跟踪差异需结合反馈估计判断。RELAX 时输出估计使用零电流，若轮子仍在转，模型的转速平方损耗项仍可能非零；反馈无效时观测值清零。
 
 | | `Mecanum` | `Omni` | `Helm` |
 | --- | --- | --- | --- |

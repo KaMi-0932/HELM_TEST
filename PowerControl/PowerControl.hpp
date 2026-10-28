@@ -141,6 +141,14 @@ class PowerControl
   /// Maximum number of motors
   static constexpr int MAX_MOTOR_COUNT = POWER_CONTROL_MAX_MOTOR_COUNT;
 
+  struct DrivePowerModel
+  {
+    float kt = 0.0f;
+    float k1 = 0.0f;
+    float k2 = 0.0f;
+    bool valid = false;
+  };
+
   /**
    * @brief 3508 组的分配偏置：先按保底池分配，再分剩余功率。
    *        Allocation bias of the 3508 group: distribute a reserve pool first, then
@@ -320,6 +328,32 @@ class PowerControl
       k1_3508_ = static_cast<float>(fmax(params_3508_(0, 0), 1.0e-07f));
       k2_3508_ = static_cast<float>(fmax(params_3508_(1, 0), 1.0e-07f));
     }
+  }
+
+  /**
+   * @brief 读取同一时刻的 3508 驱动轮功率模型参数。
+   *        Read a consistent snapshot of the 3508 drive-wheel power model.
+   */
+  DrivePowerModel GetDrivePowerModel()
+  {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    DrivePowerModel model{kt_3508_, k1_3508_, k2_3508_, false};
+    model.valid = std::isfinite(model.kt) && std::isfinite(model.k1) &&
+                  std::isfinite(model.k2) && model.kt >= 0.0f && model.k1 >= 0.0f &&
+                  model.k2 >= 0.0f;
+    return model;
+  }
+
+  /**
+   * @brief 返回扣除余量后的驱动轮功率预算，不含舵向与静态损耗。
+   *        Get the drive-only power budget after margin, excluding steering and
+   *        static loss. Non-finite limits produce a zero budget.
+   */
+  static float GetDrivePowerBudget(float max_power)
+  {
+    return std::isfinite(max_power)
+               ? std::max(0.0f, max_power - CHASSIS_POWER_LIMIT_MARGIN_W)
+               : 0.0f;
   }
 
   /**
@@ -627,7 +661,7 @@ class PowerControl
   void OutputLimitHelm(float max_power)
   {
     /* 最大功率只约束 3508 驱动轮，保留模型误差与控制延迟余量。 */
-    const float AVAILABLE_POWER = max_power - CHASSIS_POWER_LIMIT_MARGIN_W;
+    const float AVAILABLE_POWER = GetDrivePowerBudget(max_power);
 
     /* 6020 舵向电机不参与限幅，始终保留原电流命令。 */
     for (int i = 0; i < motor_count_6020_; i++)

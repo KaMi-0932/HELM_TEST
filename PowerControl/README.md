@@ -19,6 +19,8 @@ PowerControl 支持全向轮与麦轮底盘（仅 3508）和舵轮底盘（3508 
 
 - `SetAllocationBias3508(const AllocationBias3508&)`：全向轮与麦轮路径使用。启用后先把可用功率的 `reserve_fraction` 作为保底池，按 `reserve_weight[]` 分给正功率电机（不超过其需求），剩余功率再按上述权重乘以 `allocation_weight_scale[]`（未配置或不大于 0 时为 1）分配。
 - `EstimatePower(...)`：估算驱动轮、舵向和总模型正功率，并报告输入是否有效；总模型功率包括静态损耗。
+- `GetDrivePowerModel()`：由互斥锁保护，返回同一时刻的 `DrivePowerModel {kt, k1, k2, valid}`，供外部分配器使用；三个系数均有限且非负时 `valid` 为真。需要更新模型时，先调用 `CalculatePowerControlParam()`，再读取此快照。
+- `static GetDrivePowerBudget(max_power)`：返回 `max(0, max_power - 4 W)`；非有限输入返回 0。该预算与舵轮限幅使用同一接口，仅约束驱动轮，不含舵向与静态损耗。
 - `GetMeasuredPower()`：最近一次 `CalculatePowerControlParam()` 读到的实测功率。
 - `GetCapEnergy()`、`IsOnline()`：转发 `SuperPower` 的同名接口。
 
@@ -39,6 +41,8 @@ Other interfaces:
 
 - `SetAllocationBias3508(const AllocationBias3508&)`: used by the omni-wheel and mecanum path. When enabled, `reserve_fraction` of the available power forms a reserve pool, which is distributed to the motors with positive power by `reserve_weight[]` (not exceeding their demand), and the remaining power is distributed with the weights above multiplied by `allocation_weight_scale[]` (1 when unset or not greater than 0).
 - `EstimatePower(...)`: estimate the positive model power of the drive wheels, steering and total, with input validity; total model power includes static loss.
+- `GetDrivePowerModel()`: return a mutex-protected, consistent `DrivePowerModel {kt, k1, k2, valid}` snapshot for an external allocator; `valid` is true when all coefficients are finite and nonnegative. Call `CalculatePowerControlParam()` before reading the snapshot when a model update is needed.
+- `static GetDrivePowerBudget(max_power)`: return `max(0, max_power - 4 W)`, or zero for non-finite input. The steering-wheel limiter uses this same drive-only budget, excluding steering and static losses.
 - `GetMeasuredPower()`: the measured power read by the latest `CalculatePowerControlParam()`.
 - `GetCapEnergy()`, `IsOnline()`: forward the same-named interfaces of `SuperPower`.
 
